@@ -1,0 +1,464 @@
+---
+title: "Radiomics analysis derived from LGE-MRI predict sudden cardiac death in hypertrophic cardiomyopathy patients via Machine Learning"
+date: "Last update: `r format(Sys.time(), '%d %B, %Y')`" 
+output:
+  html_document:
+    toc: true
+    toc_float:
+        collapsed: true
+        smooth_scroll: true
+    toc_depth: 3
+    fig_caption: yes
+    code_folding: show
+    number_sections: true
+
+fontsize: 14pt
+
+---
+```{r setup, include=FALSE}
+#8th September 2020
+#setwd("~/Desktop/Jie/JieSeptRadiology")
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(error = TRUE)
+
+```
+
+# Load packages 
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+set.seed(132)
+
+require(readr)
+require(rsample)
+require(skimr)
+require(tidymodels)
+require(kernlab)
+require(dplyr)
+require(purrr)
+require(yardstick)
+require(tictoc)
+require(parsnip)
+require(furrr)
+require(gridExtra)
+require(grid)
+require(mlbench)
+require(probably)
+require(ROSE)
+require(discrim)
+require(modelStudio)
+require(janitor)
+require(DataExplorer)
+require(patchwork)
+library(ggforce)
+
+require(reshape2)
+require(ggplot2)
+require(future)
+require(tidyverse)
+require(future.apply)
+require(glmnet)
+require(data.table)
+
+require(survival)
+require(ranger)
+require(prodlim)
+require(riskRegression)
+require(pec)
+require(survminer)
+require(ggcorrplot)
+require(corrr)
+library(doFuture)
+
+```
+
+```{r}
+set.seed(132)
+```
+
+# Look at data 
+
+```{r}
+
+Data2a <- read.csv("JieDataWithTime.csv")[, -c(1)]
+
+Data2a <- Data2a %>% 
+ janitor::clean_names() 
+
+```
+
+
+# SuddenCardiacDeath
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, fig.height=6, fig.width=8}
+
+PivotData2a <- Data2a %>% 
+  select(-c( primary_ep,secondary_ep)) %>% 
+  pivot_longer(-c(sudden_cd,id), names_to = "Parameters", values_to = "Values") 
+
+PivotData2a$sudden_cd <- as.factor(PivotData2a$sudden_cd )
+
+for(i in 1:10){
+
+  print(
+
+    ggplot(
+
+    PivotData2a, aes(Values, colour = sudden_cd ))+
+     geom_boxplot()+
+     facet_wrap_paginate(Parameters~., nrow=4, ncol = 4,page=i, scale="free")+
+     labs(title="Density comparison between label") +  theme(text = element_text(size=8)) +
+                                                               theme_bw()
+  )
+
+}
+
+
+Data <- Data2a %>% 
+  mutate(Label = case_when(sudden_cd == "1" ~ "Yes", TRUE ~ "No" )) %>% 
+  select(-c(primary_ep,sudden_cd, secondary_ep, id)) %>% 
+  drop_na()
+
+```
+
+## Scale and filter linear combinations - Final Dataset
+
+```{r Metrics23, echo=TRUE,warning=FALSE, fig.height=19, fig.width=16}
+
+   Data <- Data %>% 
+  dplyr::rename(Time = time)
+
+names(Data) <- names(Data) %>%
+  str_replace_all(., "lvp", "lbp")
+
+
+   PreProc <- recipe(Label ~ . , data = Data) %>%
+    step_normalize(all_numeric(), -Time) %>%
+    step_nzv(all_predictors()) #%>%
+  
+  PreparedPreProc <-  PreProc  %>% 
+    prep()
+
+    invisible(x1 <- Data %>% 
+    select_if(is.numeric) %>%
+    correlate() %>%
+    rearrange() %>%
+    shave())
+    
+    rplot(x1)
+
+```
+
+## Parameters pipeline
+
+```{r PipelineA3, echo=TRUE, fig.height=8, fig.width=12, message=FALSE, warning=FALSE}
+
+source("FunctionsCox2.R") #have to make sure ggstatsplot is the first package loaded
+
+numPartitions <- 100 #number of permutations
+method <- 1 #1 - classification, 2 -  regression, 3 - multiclassification
+#alpha values (0.5,1) - EN and LASSO
+alpha <- c(1,0.5)  #could add more/different alphas to glmnet algorithms
+All2 <- Data
+FinalAll2F <- data.frame(All2)
+All2F <- FinalAll2F
+```
+
+```{r}
+
+registerDoFuture()
+plan(multiprocess, workers = 30)
+
+```
+
+## Functions - Regularization
+
+```{r PipelineB3, echo=TRUE, fig.height=8, fig.width=12, warning=FALSE}
+
+FinalAll2F$Label <- as.factor(FinalAll2F$Label)
+
+set.seed(132)
+
+sInitial3 <- lapply(1:numPartitions, function(i) { 
+  
+  smp_size <- floor(0.85 * nrow(FinalAll2F))  
+
+#cat(sprintf(" \n \n Iteration (%i/%i)" , i, numPartitions))
+  train_ind <-  sample(seq_len(nrow(FinalAll2F)), size = smp_size)
+  
+  list(Model=bake(PreparedPreProc, new_data = FinalAll2F[train_ind, ]),
+       Validation=bake(PreparedPreProc, new_data=FinalAll2F[-train_ind, ]))
+
+})
+
+
+sInitial3 <- ImbalClass(sInitial3, c("Model","Validation"),0) #This function is needed to take out those test and train sets that have 0 or just 1 sample of class representation
+
+sFS <- lapply(seq_along(sInitial3), function(i) {  #Exactly same info as sInitial3 but different format needed for EN and LASSO algorithms
+ 
+  train <-sInitial3[[i]][["Model"]]
+  test <- sInitial3[[i]][["Validation"]]
+  list(xtrain=as.matrix(train[,-c(dim(train)[2],(dim(train)[2]-1))]),ytrain = data.frame(Label=train$Label,Time = train$Time),
+       xtest = as.matrix(test[,-c(dim(train)[2],(dim(train)[2]-1))]),ytest = data.frame(Label = test$Label,Time = test$Time))
+  
+})
+
+sTog <- list(sFS,sFS) #there was another partition - but made no sense - useful if want to do a train and test further partition
+a <- sTog
+PermutedLength <- lapply(a,length)
+print(paste0("Wanted ", numPartitions, " and obtained permuted length of: ", PermutedLength[[1]], " in Feature Selection and ", PermutedLength[[2]] ," in Machine Learning data"))
+
+LassoEn1NewCox <- function(a1,alpha,method){
+  
+  aa <- future_lapply(seq_along(a1),  function(i) {cv.glmnet(a1[[i]]$xtrain, Surv(a1[[i]]$ytrain$Time,a1[[i]]$ytrain$Label), family="cox", maxit = 1000, alpha = alpha)},future.seed = 132)
+  aa.fit <- future_lapply(seq_along(a1),  function(i) {glmnet(a1[[i]]$xtrain, Surv(a1[[i]]$ytrain$Time,a1[[i]]$ytrain$Label), family="cox", maxit = 1000, alpha = alpha ,lambda=aa[[i]][["lambda.min"]])})               
+
+  
+  BetasAndNames <- lapply(seq_along(aa.fit),function(i) {q <- data.frame(Betas=data.table(as.matrix(aa.fit[[i]][["beta"]])))
+  q <- data.frame(Add= rowSums(q != 0), Names=aa.fit[[i]][["beta"]]@Dimnames[[1]]) })
+  sEN <- do.call("rbind",BetasAndNames)
+  names(sEN) <- c("Importance","Names")
+  sEN <- sEN[sEN$Importance != 0,] #take out all 0s - sparsity
+  
+}                                                  
+
+
+```
+
+## Functions - Random Forest
+
+```{r, fig.height=10, fig.width=8}
+
+set.seed(132)
+# can use future_lapply here
+RFFeature <- function(a1){
+  
+   aa <- lapply(seq_along(a1),  function(i) {
+     
+     #print(i)
+     
+     Data <- data.frame(Time=a1[[i]]$ytrain$Time, Label= a1[[i]]$ytrain$Label,a1[[i]]$xtrain)
+
+     rsf <- ranger(Surv(time= Time, event= Label) ~ ., data = Data, importance = "permutation", seed = 132)
+
+     return(data.frame(Importance=rsf$variable.importance))
+
+})
+   
+}
+
+rF <- data.frame(lapply(c(1), function(x) {RFFeature(a[[x]])}))
+
+
+RfSum2 <- rF %>% 
+  #mutate(across(.cols=everything(), ~replace(., .<0, NA))) %>%
+    mutate(across(.cols=everything(), ~percent_rank(.) )) %>%
+    add_column(Sum=rowSums(., na.rm = TRUE)) %>%
+   mutate(Rank1 = rank(Sum)) %>% #before  Rank= ifelse( Sum  > 72, 1,0 )
+  mutate(  Rank= ifelse( Rank1 > max(Rank1)-5, 1,0 )) %>% # top 5
+ # mutate(  Rank= ifelse( Sum  > 71, 1,0 )) %>%
+  add_column(Model = "RandomForest") %>%
+  mutate(Rank2 = dense_rank(-Sum))
+  
+RfSum2["Names"] <- rownames(rF) 
+
+pdd4RF <- ggplot(filter(RfSum2, Rank2 < 50), aes( x=reorder(Names,Sum  ), y = Sum, fill = Rank)) + 
+  geom_col() + 
+  coord_flip() + 
+  theme(
+    axis.text.x = element_text(size=8),legend.position="none", panel.background = element_blank(),panel.grid.minor = element_line(colour="black"),axis.line = element_line(colour = "black")
+    )+
+  labs(x="Features",y="Ranking")+
+  ggtitle("Random Forest")
+
+RfSumFin <- RfSum2 %>%
+  filter(Rank == "1") %>%
+  select(-Rank ) %>% 
+  rename( Freq = Sum)
+
+
+```
+
+## Results
+
+```{r warning=FALSE}
+
+sEN <- lapply(c(1), function(x) {lapply(c(1:2), function(i) { LassoEn1NewCox(a[[x]],alpha[i],method)})})
+mEN <- lapply(c(1), function(j) { lapply(c(1:2), function(i) {plyr::count(sEN[[j]][[i]]$Names)})}) #should not be sEN but the number of alphas introduced
+Quantile <- lapply(c(1), function(j) { lapply(c(1:2), function(i) { data.frame(Quant=quantile(mEN[[j]][[i]]$freq))})})
+ThreshLASSO <- lapply(c(1), function(j) {lapply(c(1:2), function(i) { mean(as.numeric(c(Quantile[[j]][[i]]$Quant[2], Quantile[[j]][[i]]$Quant[5])))})})
+FinalEN <-  lapply(c(1), function(j) {lapply(c(1:2), function(i) {filter(mEN[[j]][[i]], freq >= ThreshLASSO[[j]][[i]] )})})
+FinalEN <- lapply(c(1), function(j) {lapply(FinalEN[[1]], setNames,  c("Names","Importance"))})
+FinalEN <- lapply(c(1), function(j) {setNames(FinalEN[[j]],c("LASSO","EN"))})
+mEN <-  lapply(c(1), function(j) {lapply(c(1:2), function(i) { mEN <- mutate( mEN[[j]][[i]], BarLab= ifelse( mEN[[j]][[i]]$freq > ThreshLASSO[[j]][[i]], 1,0 ))})})
+
+```
+
+## Visualization feature selection 
+
+```{r LASSO87, echo=TRUE,warning=FALSE, fig.height=5, fig.width=3}
+
+pdd4 <- lapply(c(1), function(j) {
+  lapply(c(1:2), function(i) {
+    ggplot(mEN[[j]][[i]], aes(reorder(x,+freq),freq,fill=BarLab))+
+      geom_bar(stat="identity")+
+      theme(axis.text.x = element_text(size=8),legend.position="none")+
+      labs(x="Features",y="Frequency")+
+      ggtitle(paste0(names(FinalEN[[1]])[i]))+ 
+      theme(panel.background = element_blank(),panel.grid.minor = element_line(colour="black"),axis.line = element_line(colour = "black"))+
+      coord_flip()
+    })
+  })
+
+ElasticNet <- data.frame(Names=FinalEN[[1]][["EN"]][["Names"]], Freq = FinalEN[[1]][["EN"]][["Importance"]], Model = "EN")
+Lasso <- data.frame(Names=FinalEN[[1]][["LASSO"]][["Names"]], Freq = FinalEN[[1]][["LASSO"]][["Importance"]], Model = "LASSO")
+
+FinalModelSelected <- invisible(full_join(ElasticNet,Lasso))
+FinalModelSelected <- invisible(full_join(FinalModelSelected,RfSumFin))
+FinalModelSelected <- FinalModelSelected %>% mutate_if(is.character, as.factor)
+FinalModelSelected2 <- invisible(melt(FinalModelSelected))
+
+
+FeatsAll <- ggplot(
+  FinalModelSelected2, aes(reorder(Names,-value), value ,group=Model, fill=Model))+
+  geom_bar(stat="identity",width=.7, position = "dodge")+
+  theme(axis.text.x = element_text(size=10, angle=90))+
+        labs(title= paste0("Selected features") ,y=(sprintf(" Frequency & Ranking (out of %i)",PermutedLength[[1]])),x=("Features"))+
+  theme(panel.background = element_blank(),panel.grid.minor = element_line(colour="black"),axis.line = element_line(colour = "black")
+        )
+
+
+
+```
+
+```{r,  fig.height= 5, fig.width=8, echo = FALSE}
+
+FeatsAll
+
+```
+
+## Selected variables and correlation
+```{r LASSO9, echo=TRUE,warning=FALSE, fig.height= 8, fig.width=14}
+
+Lass <- pdd4[[1]][[1]]
+En <- pdd4[[1]][[2]]
+
+(Lass + En + pdd4RF)
+
+
+```
+
+```{r}
+
+SelectedVariables <- lapply(c(1), function(i) {
+  unique(c(as.character(FinalEN[[1]][["LASSO"]][["Names"]]),as.character(FinalEN[[1]][["EN"]][["Names"]]),as.character(RfSumFin$Names) ))
+  })
+
+indicators <- SelectedVariables[[1]]
+Betas_indicators <- All2F[, c(which(colnames(All2F) %in% indicators), dim(All2F)[2])]
+
+h <- ggcorrplot(cor(Betas_indicators[,-c(dim(Betas_indicators)[2])]), lab_size = 3,tl.cex = 8, hc.order=TRUE, type='lower', lab = TRUE)
+print(h)
+
+```
+
+
+
+```{r}
+
+Un1 <- indicators
+Un1
+
+if (length(Un1) > 20 ){
+  print("here")
+  Un1 <- unique(by_species2[order(by_species2$rank),][c(1:4),c(1)])$Names  #dont care if it very well correlated or not - just care taht it IS correlated. 
+  lst2 <- sapply(seq_along(Un1), function(j) combn(Un1, j, simplify= FALSE))
+  v2 <- rapply(lst2, toString)
+
+  }else{
+  lst2 <- sapply(seq_along(Un1), function(j) combn(Un1, j, simplify= FALSE))
+  v2 <- rapply(lst2, toString)
+}
+
+v2 <- v2[1:55] #only individual features and paired combination
+
+```
+
+
+
+```{r}
+
+sModel4 <- lapply(sInitial3, function (x) lapply( 1:length(v2) , function(i)  x[[1]][intersect(c(unlist(strsplit(v2[i],", ")), "Label","Time"), colnames(sInitial3[[1]][["Model"]]))]))
+sVal4 <- lapply(sInitial3, function (x) lapply( 1:length(v2) , function(i)  x[[2]][intersect(c(unlist(strsplit(v2[i],", ")), "Label","Time"), colnames(sInitial3[[1]][["Model"]]))])) #this x[[1]] and x[[2]] are what established Model and Validation
+
+```
+
+## C-index calculation - training 
+
+
+```{r}
+
+ Conc <- lapply(seq_along(sVal4[[1]]), function(i) {
+  
+  lapply(seq_along(sVal4), function(x)  {
+    
+    #cat(sprintf(" \n \n Processing combination %s (%i/%i) \n In permutation %i/%i \n \n",v2[i],i,length(v2), x,length(sVal4)))
+    
+    cox <- coxph(Surv(Time,as.numeric(Label)) ~ ., data=sModel4[[x]][[i]]) 
+    Conc <- cox[["concordance"]][["concordance"]]
+      return(Conc)})})
+
+
+```
+## Visualization C-index
+
+```{r}
+
+Single <- data.frame(matrix(unlist(Conc), ncol=length(v2)))
+names(Single) <- v2
+Single <- rbind(Single,colMeans(Single))
+Single2 <- invisible(melt(Single))
+
+Single2$variable <- as.factor(Single2$variable)
+
+AllTogether2 <- Single2 #select only non random models
+
+AllTogether2  <- mutate(AllTogether2, NumVar=(str_count(variable, ',')+1))
+AllTogether2  <- mutate(AllTogether2, LVP19Yes=(str_count(variable, 'lbp_19')))
+
+AllTogether2$NumVar <- as.numeric(AllTogether2$NumVar)
+AllTogether2$LVP19Yes <- as.factor(AllTogether2$LVP19Yes)
+
+AllTogether3 <- AllTogether2 %>% filter(NumVar <=3 )
+
+hh2 <- ggboxplot(filter(AllTogether3) ,x="variable", y="value", fill="LVP19Yes",palette = "jco")+
+  labs(title= paste0("Concordance") ,y=paste("Concordance"),x=("Models"))+
+  theme(axis.text.x = element_text(size=10, angle=90))
+
+
+print(hh2)
+
+```
+
+```{r}
+
+set.seed(132)
+
+AllTogether4 <- filter(AllTogether3, LVP19Yes == "1")
+
+Means <- aggregate(value ~  NumVar+variable, AllTogether4, mean)
+Sd <- aggregate(value ~  NumVar+variable, AllTogether4, sd)
+Means["sd"] <- Sd$value
+Means["rank"] <- rank(rank(-Means$value),ties.method ='first')
+SelectedTen <- Means[order(Means$rank),][1:10,]
+q <- Means %>% 
+  group_by(NumVar) %>% 
+  filter(NumVar == "2") %>%
+  ungroup() %>%
+  arrange(-value) %>%
+  select(-c(NumVar, rank))
+grid.arrange(top="C-index combination", tableGrob(data.frame(q)))
+
+```
+
+
